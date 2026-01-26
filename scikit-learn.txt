@@ -1,0 +1,18 @@
+Estimator (ha fit)
+│
+├── Predictor (fit + predict)
+│   ├── Classification
+│   ├── Regression
+│   └── Clustering
+│
+└── Transformer (fit + transform)
+    └── Dimensionality Reduction
+
+In scikit-learn tutte le macroaree sono implementate come estimators;
+classification, regression e clustering usano predictor,
+mentre la dimensionality reduction usa transformer.
+
+Classification sceglie una categoria, Regression stima una quantità,
+Clustering scopre gruppi di dati, Dimensionality Reduction cambia la rappresentazione dei dati.
+
+Una serie di transformers con un estimator di tipo predictor finale (opzionale(?)) è detta pipeline.
