@@ -58,13 +58,13 @@ def calculator():
     return df_battles
     
 pd.set_option('display.max_columns', None)
-csv = pd.read_csv("pokemon/National_Pokedex.csv")
+csv = pd.read_csv("pylibs/csv_samples/National_Pokedex.csv")
 df_dummies = (pd.get_dummies(csv["Type1"]).fillna(0) + pd.get_dummies(csv["Type2"]).fillna(0)).astype(float) # one hot encoding
 csv = pd.concat([csv, df_dummies], axis=1)
 
 cols = list(csv.loc[:, "HP":"Spd"].columns) + list(df_dummies.columns)
 
-#tip_advantage = csv["Total"] * type_effectiveness(1, 1, 1, 1)
+# tip_advantage = csv["Total"] * type_effectiveness(1, 1, 1, 1)
 
 X = []
 y = []
@@ -73,7 +73,7 @@ for row in calculator().itertuples():
     A = csv.loc[row.A_index]
     B = csv.loc[row.B_index]
 
-    # Feature = differenza delle statistiche
+    # feature = differenza delle statistiche
     features = list((A[cols] - B[cols]).values)
     effA = type_effectiveness(A["Type1"], A["Type2"], B["Type1"], B["Type2"])
     effB = type_effectiveness(B["Type1"], B["Type2"], A["Type1"], A["Type2"])
@@ -101,4 +101,5 @@ plt.plot([0,1],[0,1], 'r--')  # ideal line y=x
 plt.xlabel("True freq")
 plt.ylabel("Predicted freq")
 plt.title("curva")
+
 plt.show()
