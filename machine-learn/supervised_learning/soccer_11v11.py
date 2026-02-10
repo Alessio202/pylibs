@@ -17,9 +17,11 @@ class SoccerParallelEnv(ParallelEnv):
     def __init__(self, render_mode=None):
         self.width, self.height = 1000, 600
         self.player_radius, self.ball_radius = 9, 6
+        self.ball_curve_effect = 0.0
+        self.is_penalty = False
         self.anchor_recovery_timer = 0
         self.post_kick_grace_period = 0 
-        self.max_speed = 1.45  # Increased again for better ball chasing
+        self.max_speed = 2.0  # Increased again for better ball chasing
         self.friction = 0.77  
         self.ball_speed = 2.5
         self.stun_timer = np.zeros(22)
@@ -33,6 +35,12 @@ class SoccerParallelEnv(ParallelEnv):
         self.free_kick_taker_idx = None
         self.free_kick_team = None
         self.mandatory_wait = 0
+        self.match_timer = 60 * 60  # 60 secondi a 60 FPS (1 minuto) 
+        self.is_penalty_shootout = False
+        self.penalty_turn = 0 # 0 per blu, 1 per rossi
+        self.penalties_taken = 0
+        self.penalty_shootout_phase = 0  # 0=in preparazione, 1=tirando, 2=risultato
+
 
         self.action_spaces = {
             "blue": spaces.MultiDiscrete([7]*11),
@@ -54,6 +62,9 @@ class SoccerParallelEnv(ParallelEnv):
         # NUOVO: Definisci formazioni base (4-3-3)
         self._init_formations()
 
+        self.penalty_results = []  # Lista per tracciare i risultati dei rigori
+        self.contact_counters = np.zeros((22, 22))  # Inizializza qui
+        
         self.reset()
 
     def _init_formations(self):
@@ -95,6 +106,128 @@ class SoccerParallelEnv(ParallelEnv):
         self.red_formation_433 = {i: (w - x, y) for i, (x, y) in self.blue_formation_433.items()}
         self.red_formation_451 = {i: (w - x, y) for i, (x, y) in self.blue_formation_451.items()}
 
+    def _setup_penalty(self, victim_idx, shooting_team):
+        """Setup per un calcio di rigore (NON per penalty shootout)"""
+        print(f"Setup penalty per {shooting_team}, tiratore {victim_idx}")
+        
+        self.free_kick_active = True
+        self.free_kick_timer = 180
+        self.free_kick_team = shooting_team
+        self.free_kick_taker_idx = victim_idx
+        self.ball_curve_effect = 0.0
+        self.is_penalty = True
+        self.mandatory_wait = 60
+        
+        # Reset fisici
+        self.ball_vel = np.zeros(2)
+        self.ball_spin = 0
+        
+        # Posizioni per rigore BLU (attaccano a destra)
+        if shooting_team == "blue":
+            self.ball_pos = np.array([880.0, 300.0])
+            self.players_pos[victim_idx] = np.array([850.0, 300.0])
+            self.players_pos[11] = np.array([995.0, 300.0])  # Portiere rosso
+            
+            # TUTTI gli altri giocatori BLU dietro la linea di centrocampo (sinistra)
+            for i in range(0, 11):
+                if i != victim_idx and i != 0:  # Escludi tiratore e portiere blu
+                    x_pos = random.uniform(100, 300)  # Metà campo sinistra
+                    y_pos = 100 + (i * 40)
+                    self.players_pos[i] = np.array([x_pos, y_pos])
+            
+            # Portiere blu in porta (ma lontano)
+            self.players_pos[0] = np.array([80.0, 300.0])
+            
+            # TUTTI gli altri giocatori ROSSI dietro la linea di centrocampo (destra)
+            for i in range(12, 22):
+                x_pos = random.uniform(700, 900)  # Metà campo destra (ma dietro)
+                y_pos = 100 + ((i-11) * 40)
+                self.players_pos[i] = np.array([x_pos, y_pos])
+        
+        else:  # ROSSI (attaccano a sinistra)
+            self.ball_pos = np.array([120.0, 300.0])
+            self.players_pos[victim_idx] = np.array([150.0, 300.0])
+            self.players_pos[0] = np.array([5.0, 300.0])  # Portiere blu
+            
+            # TUTTI gli altri giocatori ROSSI dietro la linea di centrocampo (destra)
+            for i in range(11, 22):
+                if i != victim_idx and i != 11:  # Escludi tiratore e portiere rosso
+                    x_pos = random.uniform(700, 900)  # Metà campo destra
+                    y_pos = 100 + ((i-11) * 40)
+                    self.players_pos[i] = np.array([x_pos, y_pos])
+            
+            # Portiere rosso in porta (ma lontano)
+            self.players_pos[11] = np.array([995.0, 300.0])
+            
+            # TUTTI gli altri giocatori BLU dietro la linea di centrocampo (sinistra)
+            for i in range(1, 11):
+                x_pos = random.uniform(100, 300)  # Metà campo sinistra (ma dietro)
+                y_pos = 100 + (i * 40)
+                self.players_pos[i] = np.array([x_pos, y_pos])
+        
+        # Velocità a zero per tutti
+        for i in range(22):
+            self.players_vel[i] = np.zeros(2)
+        
+        # Solo tiratore e portiere difendente NON stunnati
+        defending_gk = 11 if shooting_team == "blue" else 0
+        for i in range(22):
+            if i == victim_idx or i == defending_gk:
+                self.stun_timer[i] = 0
+            else:
+                self.stun_timer[i] = self.free_kick_timer
+        
+    def _setup_penalty_shootout_kick(self):
+        """Setup per un singolo rigore nel penalty shootout"""
+        self.penalty_shootout_phase = 0  # Fase preparazione
+        
+        # Determina chi tira (sempre verso la porta di DESTRA per entrambe le squadre)
+        shooting_team = "blue" if self.penalties_taken % 2 == 0 else "red"
+        
+        # Usa sempre la porta di DESTRA (porta blu)
+        self.ball_pos = np.array([880.0, 300.0])  # Dischetto destro
+        
+        if shooting_team == "blue":
+            # Blu tira verso la propria porta (destra)
+            taker_idx = 9  # Attaccante blu
+            defending_gk = 11  # Portiere rosso
+            self.players_pos[taker_idx] = np.array([850.0, 300.0])
+            self.players_pos[defending_gk] = np.array([995.0, 300.0])
+        else:
+            # Rossi tirano verso la porta di destra (quindi attaccano in direzione opposta)
+            taker_idx = 20  # Attaccante rosso
+            defending_gk = 11  # Portiere rosso (stesso portiere, ma ora deve difendere)
+            # Posiziona il tiratore rosso dall'altra parte del campo
+            self.players_pos[taker_idx] = np.array([850.0, 300.0])
+            self.players_pos[defending_gk] = np.array([995.0, 300.0])
+        
+        # Posiziona tutti gli altri giocatori a bordo campo
+        for i in range(22):
+            if i not in [taker_idx, defending_gk]:
+                # Posiziona lungo i bordi laterali
+                if i < 11:  # Blu
+                    self.players_pos[i] = np.array([50.0, 50.0 + (i * 25)])
+                else:  # Rossi
+                    self.players_pos[i] = np.array([950.0, 50.0 + ((i-11) * 25)])
+        
+        # Setup stato free kick per il rigore
+        self.free_kick_active = True
+        self.free_kick_timer = 60  # 1 secondo di preparazione
+        self.free_kick_team = shooting_team
+        self.free_kick_taker_idx = taker_idx
+        self.is_penalty = True
+        
+        # Reset fisici
+        self.ball_vel = np.zeros(2)
+        self.ball_spin = 0
+    
+    def _start_penalty_shootout(self):
+        self.is_penalty_shootout = True
+        self.penalty_shootout_phase = 0
+        self.penalties_taken = 0
+        self.penalty_results = []  # Reset risultati
+        self._setup_penalty_shootout_kick()
+
     def reset(self, seed=None, options=None):
         self.agents = self.possible_agents[:]
         self.players_pos = np.zeros((22,2), dtype=np.float32)
@@ -114,8 +247,41 @@ class SoccerParallelEnv(ParallelEnv):
         self.same_team_pass_count = 0
 
         self._reset_positions()
+        self.anchor_disabled = np.zeros(22, dtype=bool) 
+        self.attacking_in_box = []
         return self._get_obs(), {}
 
+    def _handle_penalty_shootout_result(self, rewards, terminations):
+        """Gestisce il risultato finale del penalty shootout"""
+        # Conta i goal per squadra
+        blue_goals = sum(1 for team, scored in self.penalty_results if team == "blue" and scored)
+        red_goals = sum(1 for team, scored in self.penalty_results if team == "red" and scored)
+        
+        # Determina se c'è un vincitore dopo 10 rigori
+        if self.penalties_taken >= 10:
+            # Se siamo in sudden death (dopo 10 rigori) e c'è differenza di goal
+            if blue_goals != red_goals:
+                terminations = {"blue": True, "red": True}
+                if blue_goals > red_goals:
+                    rewards["blue"] += 100
+                    rewards["red"] -= 100
+                    self._update_elo("blue")
+                else:
+                    rewards["red"] += 100
+                    rewards["blue"] -= 100
+                    self._update_elo("red")
+                return True, rewards, terminations
+            
+            # Se dopo 10 rigori è ancora pari, continua con sudden death
+            elif self.penalties_taken >= 20:  # Limite massimo per evitare loop infinito
+                terminations = {"blue": True, "red": True}
+                # Pareggio dopo 20 rigori
+                rewards["blue"] -= 50
+                rewards["red"] -= 50
+                print(f"PAREGGIO AI RIGORI DOPO 20 TENTATIVI! {blue_goals}-{red_goals}")
+                return True, rewards, terminations
+        
+        return False, rewards, terminations
 
     def step(self, actions):
         # --- 1. INIZIALIZZAZIONE DIZIONARI (Essenziale per evitare errori) ---
@@ -132,22 +298,97 @@ class SoccerParallelEnv(ParallelEnv):
                     pygame.quit()
                     exit()
         
-        if self.free_kick_active:
-            self.ball_vel = np.zeros(2) # Blocca la palla durante l'attesa
-            self.free_kick_timer -= 1
-            team_acts = actions[self.free_kick_team]
-            taker_rel_idx = self.free_kick_taker_idx % 11
+        # --- 3. GESTIONE TEMPO PARTITA ---
+        if not self.is_penalty_shootout:
+            self.match_timer -= 1
+            if self.match_timer <= 0:
+                if self.blue_score == self.red_score:
+                    self._start_penalty_shootout()
+                else:
+                    # Termina la partita se non c'è pareggio
+                    terminations = {"blue": True, "red": True}
+                    # Aggiorna ELO e ricompense finali
+                    if self.blue_score > self.red_score:
+                        self._update_elo("blue")
+                        rewards["blue"] += 50
+                        rewards["red"] -= 50
+                    else:
+                        self._update_elo("red")
+                        rewards["red"] += 50
+                        rewards["blue"] -= 50
+                    return self._get_obs(), rewards, terminations, truncations, infos
+        
+        # --- 4. GESTIONE PENALTY SHOOTOUT ---
+        if self.is_penalty_shootout:
+            # Controlla se il penalty shootout è finito
+            shootout_ended, rewards, terminations = self._handle_penalty_shootout_result(rewards, terminations)
+            if shootout_ended:
+                return self._get_obs(), rewards, terminations, truncations, infos
             
-            if self.free_kick_timer <= 0:
-                auto_action = 2
-                self._execute_free_kick_ml(auto_action)
-                self.stun_timer[:] = 0 
-                self.free_kick_active = False
-                
-                if self.render_mode == "human": self.render()
+            # Gestione normale del penalty shootout
+            if not self.free_kick_active and self.penalty_shootout_phase == 2:
+                # Aspetta un po' prima di passare al prossimo rigore
+                if not hasattr(self, 'result_wait_timer'):
+                    self.result_wait_timer = 30  # Aspetta 0.5 secondi
+                else:
+                    self.result_wait_timer -= 1
+                    if self.result_wait_timer <= 0:
+                        self.penalty_shootout_phase = 0
+                        delattr(self, 'result_wait_timer')
+                        self._setup_penalty_shootout_kick()
+            elif not self.free_kick_active and self.penalty_shootout_phase == 0:
+                # Inizia il countdown per il tiro
+                self.penalty_shootout_phase = 1
+                self.free_kick_timer = 60  # 1 secondo per prepararsi
+        
+        # --- 5. GESTIONE FREE KICK / PENALTY (INCLUSE ESECUZIONI) ---
+        if self.free_kick_active:
+            self.ball_vel = np.zeros(2)
+            self.ball_spin = 0
+            self.free_kick_timer -= 1
+
+            # durante il conto alla rovescia la palla è ferma
+            if self.free_kick_timer > 0:
+                if self.render_mode == "human":
+                    self.render()
                 return self._get_obs(), rewards, terminations, truncations, infos
 
-        # --- 3. GESTIONE RINVIO DAL FONDO (PAUSA E LANCIO) ---
+            # ESECUZIONE TIRO (Quando il timer scade)
+            if self.is_penalty:
+                # Usa l'azione del tiratore per determinare la direzione
+                shooting_team = self.free_kick_team
+                taker_idx = self.free_kick_taker_idx
+                taker_action = actions[shooting_team][taker_idx % 11] if shooting_team in actions else 4
+                
+                # Mappa l'azione a una direzione (0-6 -> 0-6 per il tiro)
+                # Per i rigori: 0=alto sinistra, 1=alto centro, 2=alto destra
+                #               3=basso sinistra, 4=basso centro, 5=basso destra, 6=al centro
+                mapped_action = min(taker_action, 6)
+                
+                # Esegui il tiro
+                self._execute_free_kick_ml(mapped_action)
+                
+                if self.is_penalty_shootout:
+                    self.penalty_shootout_phase = 2  # Fase risultato
+                    self.penalties_taken += 1
+            else:
+                # Free kick normale (non rigore)
+                self.ball_spin = random.uniform(-0.1, 0.1)
+                self._execute_free_kick_ml(4)
+
+            # Sblocca tutti i giocatori dopo il tiro
+            for i in range(22):
+                self.stun_timer[i] = 0
+            
+            # Pulisci stati
+            self.is_penalty = False
+            self.free_kick_active = False
+
+            if self.render_mode == "human":
+                self.render()
+            return self._get_obs(), rewards, terminations, truncations, infos
+
+        # --- 6. GESTIONE GOAL KICK ---
         if self.is_goal_kick:
             self.goal_kick_timer -= 1
             
@@ -161,7 +402,7 @@ class SoccerParallelEnv(ParallelEnv):
                 return self._get_obs(), rewards, terminations, truncations, infos
             else:
                 self.is_goal_kick = False
-                self.post_kick_grace_period = 360
+                self.post_kick_grace_period = 60
                 is_corner = self.ball_pos[0] < 50 or self.ball_pos[0] > self.width - 50
 
                 if is_corner:
@@ -204,66 +445,65 @@ class SoccerParallelEnv(ParallelEnv):
 
                 return self._get_obs(), rewards, terminations, truncations, infos
 
-        # --- 4. LOGICA MOVIMENTO E FISICA ---
+        # --- 7. UNICO LOOP MOVIMENTO E FISICA ---
         prev_ball_x = self.ball_pos[0]
 
         for i in range(22):
-            # --- GESTIONE DRIBBLING ---
-            is_dribbling = self._handle_dribbling(i) # Questa funzione deve gestire dribble_timer e ball_pos
-            
-            # --- MOVIMENTO IA ---
             team_key = "blue" if i < 11 else "red"
             act_idx = i if i < 11 else i - 11
+                
+            # 1. Movimento IA
             self._move_player(i, actions[team_key][act_idx])
-
-            # --- APPLICAZIONE VINCOLI (Le nostre funzioni!) ---
             self._apply_positional_anchor(i)
             self._apply_teammate_spacing(i)
+            self.players_pos[i] += self.players_vel[i]
+            
+            # 2. Muro Invisibile (Solo durante i calci piazzati)
+            # 2. Muro Invisibile (Solo durante i calci piazzati)
+            if self.free_kick_active and self.is_penalty:
+                # Per i rigori, impedisci a TUTTI i giocatori di avvicinarsi all'area
+                if i != self.free_kick_taker_idx and i != 0 and i != 11:
+                    if self.free_kick_team == "blue":
+                        # Se sei blu e stai dalla parte sbagliata (destra), torna indietro
+                        if self.players_pos[i][0] > 500:  # Linea di centrocampo
+                            self.players_pos[i][0] = 500
+                            self.players_vel[i] = np.zeros(2)
+                    else:
+                        # Se sei rosso e stai dalla parte sbagliata (sinistra), torna indietro
+                        if self.players_pos[i][0] < 500:  # Linea di centrocampo
+                            self.players_pos[i][0] = 500
+                            self.players_vel[i] = np.zeros(2)
 
-            # --- GESTIONE RALLENTAMENTO (SLOW) ---
+            # 3. Gestione Slow e Stun
             if self.slow_timer[i] > 0:
-                progress = 1.0 - (self.slow_timer[i] / 120.0)
-                speed_factor = 0.1 + (0.9 * progress)
-                self.players_vel[i] *= speed_factor
+                self.players_vel[i] *= 0.8
                 self.slow_timer[i] -= 1
 
-            # --- ESECUZIONE FISICA POSIZIONE ---
-            # Se è stordito (stun), non si muove
             if self.stun_timer[i] > 0:
                 self.players_vel[i] = np.zeros(2)
                 self.stun_timer[i] -= 1
             
-            self.players_pos[i] += self.players_vel[i]
-
-            # --- CALCIO (Solo se non sta dribblando) ---
-            if not is_dribbling and actions[team_key][act_idx] >= 5:
+            self._handle_dribbling(i)
+            is_dribbling = (self.dribble_timer[i] > 0)
+            if not self.free_kick_active and not is_dribbling and actions[team_key][act_idx] >= 5:
                 self._kick(i, 0 if i < 11 else 1)
 
-        # Fisica Palla (Effetto Magnus + Attrito)
-        if np.linalg.norm(self.ball_vel) > 0.5:
+        # --- 8. FISICA PALLA (Effetto Magnus + Attrito) ---
+        if np.linalg.norm(self.ball_vel) > 0.6:
             perp_vel = np.array([-self.ball_vel[1], self.ball_vel[0]])
             
-            # RIDUZIONE DRASTICA: Da 0.06 a 0.025 per tiri più tesi e meno "a cerchio"
-            # Moltiplichiamo per 0.8 se la velocità è molto alta per evitare curve assurde
-            speed_damp = 0.8 if np.linalg.norm(self.ball_vel) > 10 else 1.0
-            
-            self.ball_vel += (perp_vel * self.ball_spin) * (0.025 * speed_damp) 
-            
-            # Lo spin deve esaurirsi molto più velocemente (0.98 -> 0.94)
-            self.ball_spin *= 0.94
+            # Usa solo ball_spin
+            self.ball_vel += (perp_vel * self.ball_spin) * 0.015 
+            self.ball_spin *= 0.95
         
-        # Nel metodo step(), se la palla è in volo da punizione:
         if hasattr(self, 'ball_curve_effect') and np.linalg.norm(self.ball_vel) > 5:
-            # Applica forza perpendicolare alla velocità (effetto a giro)
             perp_vel = np.array([-self.ball_vel[1], self.ball_vel[0]])
             self.ball_vel += perp_vel * self.ball_curve_effect
 
         self.ball_pos += self.ball_vel
         self.ball_vel *= 0.97
         
-        # --- 5. LOGICA GOAL ---
-        # --- 5. LOGICA GOAL (MODIFICATA) ---
-        # --- 5. LOGICA GOAL ---
+        # --- 9. LOGICA GOAL (AGGIORNAMENTO PER PENALTY SHOOTOUT) ---
         if 250 < self.ball_pos[1] < 350:
             goal_scored = False
             
@@ -274,45 +514,88 @@ class SoccerParallelEnv(ParallelEnv):
                 rewards["blue"] -= 120
                 goal_scored = True
                 
+                # Se è penalty shootout, registra il risultato
+                if self.is_penalty_shootout and self.penalty_shootout_phase == 2:
+                    self.penalty_results.append(("red", True))
+                    print(f"RIGORE ROSSO: GOAL!")
+                
             # Goal Squadra Blu (Palla oltre il bordo destro)
             elif self.ball_pos[0] > self.width:
                 self.blue_score += 1
                 rewards["blue"] += 120
                 rewards["red"] -= 120
                 goal_scored = True
+                
+                # Se è penalty shootout, registra il risultato
+                if self.is_penalty_shootout and self.penalty_shootout_phase == 2:
+                    self.penalty_results.append(("blue", True))
+                    print(f"RIGORE BLU: GOAL!")
 
             if goal_scored:
-                # 1. Reset Palla al centro
-                self.anchor_recovery_timer = 600  # 10 secondi a 60fps
-                self.ball_pos = np.array([self.width / 2, self.height / 2], dtype=np.float32)
-                self.ball_vel = np.zeros(2)
-                self.ball_spin = 0.0
-                
-                # 2. Reset stati fisici dei giocatori per evitare che rimangano bloccati/grigi
-                self.dribble_timer.fill(0)
-                self.slow_timer.fill(0)
-                self.stun_timer.fill(0)
-                self._reset_positions()
-                
-                # 3. Azzera le velocità correnti
-                # In questo modo il _move_player e l'anchor del frame successivo 
-                # li faranno camminare verso le posizioni di kickoff senza inerzie vecchie
-                for i in range(22):
-                    self.players_vel[i] = np.zeros(2)
-                
-                # 4. Opzionale: un piccolo periodo di grazia per rientrare in formazione
-                self.post_kick_grace_period = 300 # 1 secondo di riposizionamento "morbido"
+                # Se NON è penalty shootout, fai il reset normale
+                if not self.is_penalty_shootout:
+                    # Reset Palla al centro
+                    self.anchor_recovery_timer = 0
+                    self.ball_pos = np.array([self.width / 2, self.height / 2], dtype=np.float32)
+                    self.ball_vel = np.zeros(2)
+                    self.ball_spin = 0.0
+                    
+                    # Reset stati fisici dei giocatori
+                    self.dribble_timer.fill(0)
+                    self.slow_timer.fill(0)
+                    self.stun_timer.fill(0)
+                    self._reset_positions()
+                    
+                    # Azzera le velocità correnti
+                    for i in range(22):
+                        self.players_vel[i] = np.zeros(2)
+                    
+                    # Periodo di grazia per rientrare in formazione
+                    self.post_kick_grace_period = 300
 
                 return self._get_obs(), rewards, terminations, truncations, infos
+        
+        # Se siamo in penalty shootout e la palla è uscita senza goal, registra fallimento
+        if self.is_penalty_shootout and self.penalty_shootout_phase == 2:
+            if self.ball_pos[0] < 0 or self.ball_pos[0] > self.width or \
+               self.ball_pos[1] < 0 or self.ball_pos[1] > self.height:
+                # Palla uscita senza goal
+                shooting_team = self.free_kick_team
+                self.penalty_results.append((shooting_team, False))
+                print(f"RIGORE {shooting_team.upper()}: FALLITO!")
 
         # Controllo bordi e rinvio dal fondo (se non è goal)
         self._handle_ball_bounds(rewards)
 
-        # --- 6. COLLISIONI E REWARDS ---
+        # --- 10. COLLISIONI E REWARDS ---
         for i in range(22):
             self._collision(i, rewards)
         
-        self._handle_tackles()
+        # --- 11. LOGICA PENALITÀ RETROPASSAGGIO IN AREA ---
+        for i in range(22):
+            dist_to_ball = np.linalg.norm(self.ball_pos - self.players_pos[i])
+            if dist_to_ball < self.player_radius + self.ball_radius + 2:
+                
+                p_pos = self.players_pos[i]
+                ball_vel_x = self.ball_vel[0]
+                
+                # SQUADRA BLU (Attacca verso destra)
+                if i < 11:
+                    if p_pos[0] > 840 and 150 < p_pos[1] < 450:
+                        if ball_vel_x < -1.0:
+                            rewards["blue"] -= 7.5
+                        elif ball_vel_x > 2.0:
+                            rewards["blue"] += 2.0
+                            
+                # SQUADRA ROSSA (Attacca verso sinistra)
+                else:
+                    if p_pos[0] < 160 and 150 < p_pos[1] < 450:
+                        if ball_vel_x > 1.0:
+                            rewards["red"] -= 7.5
+                        elif ball_vel_x < -2.0:
+                            rewards["red"] += 2.0
+
+        self._handle_tackles(rewards)
 
         # Reward Avanzamento
         delta_x = self.ball_pos[0] - prev_ball_x
@@ -331,39 +614,63 @@ class SoccerParallelEnv(ParallelEnv):
                 if i != closest_idx and dist < 80:
                     rewards[team_name] -= 0.8
 
-        # --- 7. RENDERING ---
+        # --- 12. RENDERING ---
         if self.render_mode == "human":
             self.render()
 
         return self._get_obs(), rewards, terminations, truncations, infos
 
     def _move_player(self, idx, act):
+
         if self.free_kick_active:
-            is_opp_gk = (self.free_kick_team == "blue" and idx == 11) or (self.free_kick_team == "red" and idx == 0)
-            if is_opp_gk:
-                # Forza la posizione X sulla linea di porta 
-                self.players_pos[idx][0] = 950 if idx == 11 else 50
-                # Insegui la palla solo in verticale (Y) lungo la porta
-                target_y = np.clip(self.ball_pos[1], 250, 350) 
-                # ... resto del codice per il movimento verticale ...
-                move_speed = 2.5 # Velocità laterale sulla linea
-                
-                if self.players_pos[idx][1] < target_y - 5:
+            defending_gk = 11 if self.free_kick_team == "blue" else 0
+            if idx == defending_gk:
+                goal_x = 985 if idx == 11 else 15
+                x_margin = 20
+                # clamp della posizione X corrente entro il margine
+                self.players_pos[idx][0] = np.clip(self.players_pos[idx][0], goal_x - x_margin, goal_x + x_margin)
+
+                # inseguimento verticale della palla (entro i pali)
+                target_y = np.clip(self.ball_pos[1], 250, 350)
+                move_speed = 2.2
+                if self.players_pos[idx][1] < target_y - 2:
                     self.players_vel[idx][1] = move_speed
-                elif self.players_pos[idx][1] > target_y + 5:
+                elif self.players_pos[idx][1] > target_y + 2:
                     self.players_vel[idx][1] = -move_speed
                 else:
                     self.players_vel[idx][1] = 0
-                
-                # Resetta velocità X per sicurezza
-                self.players_vel[idx][0] = 0
-                return # Esci, non processare altre azioni
+
+                # Anticipazione laterale: muoviti verso la palla (non invertire il segno)
+                if hasattr(self, 'free_kick_timer'):
+                    if self.free_kick_timer < 30:
+                        predicted_dir = np.sign(self.ball_pos[0] - goal_x)  # >0 = palla a destra del goal_x
+                        self.players_vel[idx][0] = predicted_dir * 1.2
+                    else:
+                        self.players_vel[idx][0] = 0
+
+                # Logica specifica per rigore (is_penalty)
+                if getattr(self, 'is_penalty', False):
+                    if self.free_kick_timer <= 12:
+                        shooter_pos = self.players_pos[self.free_kick_taker_idx]
+                        aim_y = shooter_pos[1] + (self.ball_pos[1] - shooter_pos[1]) * 0.2
+                        dive_speed = 6.0
+                        self.players_vel[idx][1] = dive_speed if self.players_pos[idx][1] < aim_y else -dive_speed
+                        self.players_vel[idx][0] = np.sign(self.ball_pos[0] - goal_x) * 2.0
+
+                return
+
+        if self.free_kick_active and self.is_penalty:
+            # Durante i rigori, solo tiratore e portiere possono muoversi
+            if idx != self.free_kick_taker_idx and idx != defending_gk:
+                # Impedisci movimento a tutti gli altri giocatori
+                self.players_vel[idx] = np.zeros(2)
+                return
+
+
+        # --- LOGICA MOVIMENTO NORMALE ---
+        # Rimosso il 'self.players_pos += self.players_vel' da qui!
+        # Rimosso anchor e spacing (sono già nello step)
         
-        if self.stun_timer[idx] > 0:
-            self.stun_timer[idx] -= 1
-            self.players_vel[idx] *= 0.5 # Rallenta fino a fermarsi
-            self.players_pos[idx] += self.players_vel[idx]
-            return # Salta l'input dell'azione
         vel = np.zeros(2)
         if act == 1: vel[1] = -self.max_speed
         elif act == 2: vel[1] = self.max_speed
@@ -375,12 +682,9 @@ class SoccerParallelEnv(ParallelEnv):
             if dist > 0:
                 vel = (dir_to_ball / dist) * self.max_speed
 
-        self.players_vel[idx] = self.players_vel[idx]*self.friction + vel*(1-self.friction)
-        self.players_pos[idx] += self.players_vel[idx]
+        # Applica accelerazione e attrito alla velocità
+        self.players_vel[idx] = self.players_vel[idx] * self.friction + vel * (1 - self.friction)
 
-        # NUOVO ORDINE: Prima ancoriamo alla posizione, POI evitiamo collisioni
-        self._apply_positional_anchor(idx)
-        self._apply_teammate_spacing(idx)
         
         # Hard bounds - never leave the pitch
         old_pos = self.players_pos[idx].copy()
@@ -395,6 +699,8 @@ class SoccerParallelEnv(ParallelEnv):
     def _handle_dribbling(self, idx):
         # Se il giocatore è stordito, non può dribblare
         if self.stun_timer[idx] > 0:
+            return False
+        if self.post_kick_grace_period > 0:
             return False
 
         # Se il giocatore è già in dribbling, prosegui
@@ -424,7 +730,7 @@ class SoccerParallelEnv(ParallelEnv):
                     return True
         return False
     
-    def _handle_tackles(self):
+    def _handle_tackles(self, rewards):
         for i in range(11): # Team Blue
             for j in range(11, 22): # Team Red
                 # Se uno dei due sta dribblando, è immune ai tackle
@@ -448,12 +754,23 @@ class SoccerParallelEnv(ParallelEnv):
                             
                             # 2. Logica Punizione (Solo se non è un "both")
                             if victim != "both":
-                                v_pos_x = self.players_pos[victim][0]
+                                v_pos = self.players_pos[victim]
                                 # Controlliamo se la vittima è nella metà campo avversaria
                                 # Blue attacca a destra (x > 500), Red a sinistra (x < 500)
-                                is_foul_blue = (victim < 11 and 625 < v_pos_x < 900)
-                                is_foul_red = (victim >= 11 and 100 < v_pos_x < 375)
+                                #if victim < 11 and v_pos[0] > 700: # test
+                                if victim < 11 and v_pos[0] > 900 and 200 < v_pos[1] < 400:
+                                    rewards["blue"] += 15.0
+                                    self._setup_penalty(victim_idx=victim, shooting_team="blue")
+                                    return 
 
+                                # Rigore per i ROSSI (Vittima è rossa, fallo in area blu)
+                                #elif victim >= 11 and v_pos[0] < 300: # test
+                                elif victim >= 11 and v_pos[0] < 100 and 200 < v_pos[1] < 400:
+                                    rewards["red"] += 15.0
+                                    self._setup_penalty(victim_idx=victim, shooting_team="red")
+                                    return
+                                is_foul_blue = (victim < 11 and 625 < v_pos[0] < 900)
+                                is_foul_red = (victim >= 11 and 100 < v_pos[0] < 375)
                                 if (is_foul_blue or is_foul_red) and random.random() < 0.99:
                                     # Attiva il setup della punizione che abbiamo visto prima
                                     self._setup_free_kick(victim_idx=victim)
@@ -470,18 +787,31 @@ class SoccerParallelEnv(ParallelEnv):
                             self.ball_vel += np.random.uniform(-3, 3, 2)
 
     def _setup_free_kick(self, victim_idx):
+
+        # se la palla è troppo vicina al dischetto rigore, spostala leggermente
+        if abs(self.ball_pos[0] - 880) < 5 or abs(self.ball_pos[0] - 120) < 5:
+            self.ball_pos[0] += 10
+
         self.free_kick_active = True
-        self.free_kick_timer = 180 # 3 secondi di attesa (60fps)
+        self.free_kick_timer = 180  # 3 secondi a 60fps
         self.free_kick_team = "blue" if victim_idx < 11 else "red"
         self.free_kick_taker_idx = victim_idx
         self.mandatory_wait = 120
-        
-        # Attiva il timer di recupero per far tornare gli altri in posizione lentamente
-        self.anchor_recovery_timer = 600 # 10 secondi di rientro graduale
-        
+
+        # stato per disabilitare anchor a singoli giocatori
+        if not hasattr(self, 'anchor_disabled'):
+            self.anchor_disabled = np.zeros(22, dtype=bool)
+        self.anchor_disabled[:] = False
+
+        # attaccanti in area (lista per eventuale debug)
+        self.attacking_in_box = []
+
+        # niente rallentamento esagerato di rientro
+        self.anchor_recovery_timer = 0
+
         self.ball_vel = np.zeros(2)
         self.ball_spin = 0
-        
+
         my_start = 0 if self.free_kick_team == "blue" else 11
         opp_start = 11 if self.free_kick_team == "blue" else 0
         opp_goal_x = 950 if self.free_kick_team == "blue" else 50
@@ -490,49 +820,94 @@ class SoccerParallelEnv(ParallelEnv):
         vec_to_goal = np.array([target_goal_x, 300]) - self.ball_pos
         vec_to_goal /= (np.linalg.norm(vec_to_goal) + 1e-6)
 
-        # --- 1. BARRIERA SOLIDA (4 Giocatori) ---
-        wall_dist = 110 
+        # ---------- BARRIERA SOLIDA (4 difensori) ----------
+        self.free_kick_wall = [opp_start + i for i in range(1, 5)]
+        wall_dist = 110
+        perp_vec = np.array([-vec_to_goal[1], vec_to_goal[0]])
         wall_pos_base = self.ball_pos + vec_to_goal * wall_dist
-        
-        for i in range(1, 5): # Usa indici 1, 2, 3, 4 (difensori)
-            idx = opp_start + i
-            perp_vec = np.array([-vec_to_goal[1], vec_to_goal[0]]) 
-            # Offset stretto (18) per non lasciare buchi nel muro
-            offset = perp_vec * ((i-2.5) * 18) 
-            
+        wall_spacing = 18.0
+
+        for k, idx in enumerate(self.free_kick_wall):
+            offset = perp_vec * ((k - (len(self.free_kick_wall)-1)/2.0) * wall_spacing)
             self.players_pos[idx] = wall_pos_base + offset
             self.players_vel[idx] = np.zeros(2)
-            self.stun_timer[idx] = self.free_kick_timer + 20 
+            # stunna SOLO la barriera
+            self.stun_timer[idx] = self.free_kick_timer + 10
 
-        # --- 2. SCHIERAMENTO SQUADRE ---
-        for i in range(11):
-            # Squadra in attacco
+        # ---------- PORTIERE DIFENDENTE: NON STUNNATO ----------
+        gk_idx = 11 if self.free_kick_team == "blue" else 0
+        goal_x = 995.0 if gk_idx == 11 else 5.0
+        self.players_pos[gk_idx] = np.array([goal_x, 300.0])
+        self.players_vel[gk_idx] = np.zeros(2)
+        self.stun_timer[gk_idx] = 0  # portiere libero
+
+        # ---------- ATTACCANTI NELL'AREA AVVERSARIA ----------
+        for i in range(1, 11):
             a_idx = my_start + i
-            self.players_vel[a_idx] = np.zeros(2)
-            if a_idx == self.free_kick_taker_idx:
-                self.players_pos[a_idx] = self.ball_pos - vec_to_goal * 15
-                self.ball_pos = self.players_pos[a_idx].copy()
-                self.ball_vel = np.zeros(2)
-            
-            # Squadra in difesa
-            d_idx = opp_start + i
-            if i == 0: # PORTIERE: sulla linea, centro porta
-                self.players_pos[d_idx] = np.array([opp_goal_x, 300])
-            elif i >= 5: # Quelli non in barriera, marcature casuali
-                self.players_pos[d_idx] = np.array([
-                    opp_goal_x + (random.uniform(-120, -40) if self.free_kick_team=="blue" else random.uniform(40, 120)),
-                    random.uniform(150, 450)
+            if self.free_kick_team == "blue":
+                self.players_pos[a_idx] = np.array([
+                    880.0 - random.uniform(0, 60),
+                    300.0 + random.uniform(-80, 80)
                 ])
-            self.stun_timer[d_idx] = self.free_kick_timer
-    
+            else:
+                self.players_pos[a_idx] = np.array([
+                    120.0 + random.uniform(0, 60),
+                    300.0 + random.uniform(-80, 80)
+                ])
+            self.players_vel[a_idx] = np.zeros(2)
+            self.anchor_disabled[a_idx] = True
+            self.attacking_in_box.append(a_idx)
+
+        # ---------- TIRATORE ----------
+        self.players_pos[self.free_kick_taker_idx] = self.ball_pos - vec_to_goal * 15
+        self.ball_pos = self.players_pos[self.free_kick_taker_idx].copy()
+        self.players_vel[self.free_kick_taker_idx] = np.zeros(2)
+        self.stun_timer[self.free_kick_taker_idx] = 0
+
+        # ---------- FLAG "PENALTY" VISIVO ----------
+        self.is_penalty = (
+            (self.free_kick_team == "blue" and self.ball_pos[0] > 840) or
+            (self.free_kick_team == "red" and self.ball_pos[0] < 160)
+        )
+
+
+
     def _execute_free_kick_ml(self, action_val):
         # 1. Coordinate porta avversaria
-        target_x = 1000 if self.free_kick_team == "blue" else 0
+        if self.is_penalty_shootout:
+            # Nel penalty shootout, tutti tirano verso la porta di destra
+            target_x = 1000
+        else:
+            target_x = 1000 if self.free_kick_team == "blue" else 0
         
-        # 2. Mappatura azione (0-4 per i movimenti, ma usiamo l'input dell'IA)
-        # Se l'IA usa Discrete(5), action_val va da 0 a 4. 
-        # Centriamo il tiro: 0=Palo basso, 2=Centro, 4=Palo alto
-        target_y = 265 + (action_val * 17.5) 
+        self.is_penalty = False  # Reset dopo il tiro
+        self.free_kick_active = False
+        
+        # 2. Mappatura azione (0-6 per i movimenti)
+        # Per i rigori: 0=alto sinistra, 1=alto centro, 2=alto destra
+        #               3=basso sinistra, 4=basso centro, 5=basso destra, 6=al centro
+        
+        if action_val == 0:  # Alto sinistra
+            target_y = 280
+            self.ball_spin = 0.05  # Leggera curva
+        elif action_val == 1:  # Alto centro
+            target_y = 295
+            self.ball_spin = 0.0
+        elif action_val == 2:  # Alto destra
+            target_y = 310
+            self.ball_spin = -0.05  # Leggera curva
+        elif action_val == 3:  # Basso sinistra
+            target_y = 320
+            self.ball_spin = 0.05
+        elif action_val == 4:  # Basso centro
+            target_y = 310
+            self.ball_spin = 0.0
+        elif action_val == 5:  # Basso destra
+            target_y = 300
+            self.ball_spin = -0.05
+        else:  # Centro (azione 6)
+            target_y = 300
+            self.ball_spin = 0.0
         
         # 3. Calcolo Vettore Direzione
         diff = np.array([target_x, target_y]) - self.ball_pos
@@ -540,33 +915,35 @@ class SoccerParallelEnv(ParallelEnv):
         direction = diff / (dist + 1e-6)
         
         # 4. APPLICAZIONE FISICA ISTANTANEA
-        # Aumentiamo la velocità a 16.0 per renderlo un vero "proiettile"
-        self.ball_vel = direction * 16.0 
+        # Velocità molto alta per il rigore
+        self.ball_vel = direction * 18.0 
+        self.post_kick_grace_period = 20
         
-        # 5. EFFETTO A GIRO (Magnus Effect)
-        # Se action_val < 2 curva in un senso, > 2 nell'altro
-        self.ball_curve_effect = (action_val - 2) * 0.02
-        self.ball_spin = self.ball_curve_effect * 5.0
-        
-        # 6. STATI SPECIALI
+        # 5. STATI SPECIALI
         self.ball_is_free_kick = True
-        self.free_kick_active = False # Fondamentale per sbloccare il ball_vel = 0 nello step()
+        self.free_kick_active = False  # Fondamentale per sbloccare il ball_vel = 0 nello step()
         
-        # 7. SBLOCCO GIOCATORI
-        # Azzeriamo tutti i timer di blocco così possono correre sulla ribattuta
-        self.stun_timer.fill(0) 
-        
-        # Feedback visivo: un piccolo "fumo" o reset delle collisioni
+        # Feedback
         self.last_touch_team = self.free_kick_team
         self.anchor_recovery_timer = 600  # 10 secondi a 60fps
+        
+        if self.is_penalty_shootout:
+            self.penalty_shootout_phase = 2  # Passa alla fase risultato
+            self.penalties_taken += 1
 
         
 
     def _apply_positional_anchor(self, idx):
-        # 1. Gestione Grace Period
+    # Gestione Grace Period
         if idx == 0 and self.post_kick_grace_period > 0:
             self.post_kick_grace_period -= 1
 
+        # Se il free kick è attivo e l'anchor è disabilitato per questo giocatore, non forzarlo
+        if getattr(self, 'anchor_disabled', None) is not None and self.anchor_disabled[idx]:
+            return
+
+        if self.free_kick_active:
+            return
         # 2. Marcatura speciale Goal Kick (invariata, serve per i corner)
         if self.is_goal_kick:
             if self.ball_pos[0] < 50 or self.ball_pos[0] > self.width - 50:
@@ -668,6 +1045,9 @@ class SoccerParallelEnv(ParallelEnv):
         # Inizializza un dizionario per i contatori di contatto se non esiste
         if not hasattr(self, 'contact_counters'):
             self.contact_counters = np.zeros((22, 22))
+        
+        if self.free_kick_active:
+            return
 
         # 1. PARAMETRI DI BASE
         if self.is_goal_kick:
@@ -812,14 +1192,20 @@ class SoccerParallelEnv(ParallelEnv):
                 self._goal_kick_reset(defending_team)
 
     def _kick(self, idx, team):
+        if self.post_kick_grace_period > 0:
+            return False
+        
         dist = np.linalg.norm(self.ball_pos - self.players_pos[idx])
-        # Distanza di contatto ridotta per realismo
+        
+        # Distanza di contatto aumentata per rendere più facile tirare
         if dist < self.player_radius + self.ball_radius + 5:
             current_team = "blue" if team == 0 else "red"
+            
             if self.last_touch_team == current_team: 
                 self.same_team_pass_count += 1
             else: 
                 self.same_team_pass_count = 0
+            
             self.last_touch_team = current_team
 
             rel = idx % 11
@@ -827,40 +1213,125 @@ class SoccerParallelEnv(ParallelEnv):
             
             # DECISIONE: Tiro o Passaggio?
             is_shooting = False
-            if rel >= 8 and random.random() < 0.7:
-                # Bersaglio: Porta avversaria
-                target_x = self.width + 20 if team == 0 else -20
-                target = np.array([target_x, self.height / 2])
-                is_shooting = True
+            
+            # LOGICA TIRO MIGLIORATA:
+            pos = self.players_pos[idx]
+            
+            # Per la squadra BLU (attacca a destra)
+            if team == 0:
+                # Condizioni per tirare per i Blu
+                in_attacking_half = pos[0] > self.width * 0.6
+                close_to_goal = pos[0] > self.width - 200
+                good_angle = 200 < pos[1] < 400
+                
+                # Probabilità di tiro basata sulla posizione
+                if close_to_goal and good_angle:
+                    shoot_prob = 0.9
+                elif in_attacking_half and good_angle and rel >= 8:
+                    shoot_prob = 0.8
+                elif in_attacking_half:
+                    shoot_prob = 0.6
+                else:
+                    shoot_prob = 0.3
+            
+            # Per la squadra ROSSA (attacca a sinistra)
             else:
-                # Bersaglio: Compagno casuale
-                mate = random.choice(teammates)
-                target = self.players_pos[mate]
+                # Condizioni per tirare per i Rossi
+                in_attacking_half = pos[0] < self.width * 0.4
+                close_to_goal = pos[0] < 200
+                good_angle = 200 < pos[1] < 400
+                
+                # Probabilità di tiro basata sulla posizione
+                if close_to_goal and good_angle:
+                    shoot_prob = 0.9
+                elif in_attacking_half and good_angle and rel >= 8:
+                    shoot_prob = 0.8
+                elif in_attacking_half:
+                    shoot_prob = 0.6
+                else:
+                    shoot_prob = 0.3
+            
+            # Decidi se tirare
+            is_shooting = random.random() < shoot_prob
+            
+            if is_shooting:
+                # Tiro in porta
+                if team == 0:  # Blu tira a destra
+                    target_x = self.width + 50
+                    target_y = 300 + random.uniform(-50, 50)
+                else:  # Rossi tirano a sinistra
+                    target_x = -50
+                    target_y = 300 + random.uniform(-50, 50)
+                
+                target = np.array([target_x, target_y])
+                
+                # Aumenta la potenza del tiro
+                power_mult = random.uniform(1.5, 2.0)
+            else:
+                # Passaggio a un compagno
+                possible_mates = [m for m in teammates if m != idx]
+                if possible_mates:
+                    # Preferisci compagni più avanzati
+                    mate_weights = []
+                    for m in possible_mates:
+                        mate_pos = self.players_pos[m]
+                        if team == 0:
+                            # Per i Blu, preferisci compagni più a destra
+                            weight = max(0.1, mate_pos[0] / self.width)
+                        else:
+                            # Per i Rossi, preferisci compagni più a sinistra
+                            weight = max(0.1, (self.width - mate_pos[0]) / self.width)
+                        mate_weights.append(weight)
+                    
+                    # Normalizza i pesi - CORREZIONE CRITICA
+                    total_weight = sum(mate_weights)
+                    if total_weight > 0:
+                        # Calcola le probabilità
+                        probabilities = [w/total_weight for w in mate_weights]
+                        
+                        # ASSICURA CHE LA SOMMA SIA ESATTAMENTE 1
+                        # Questo corregge gli errori di floating-point
+                        probabilities = np.array(probabilities, dtype=np.float64)
+                        probabilities /= probabilities.sum()  # Rinominalizza
+                        
+                        # Se ancora non somma a 1 (per arrotondamento), corregge
+                        if abs(probabilities.sum() - 1.0) > 1e-10:
+                            probabilities[-1] += 1.0 - probabilities.sum()
+                        
+                        mate = np.random.choice(possible_mates, p=probabilities)
+                    else:
+                        # Se tutti i pesi sono 0, scegli a caso
+                        mate = random.choice(possible_mates)
+                    
+                    target = self.players_pos[mate]
+                    power_mult = 1.0
+                else:
+                    # Se non ci sono compagni, tira a caso
+                    target = np.array([random.uniform(0, self.width), 
+                                    random.uniform(0, self.height)])
+                    power_mult = 0.8
 
             # CALCOLO DIREZIONE E VELOCITÀ
             direction = target - self.players_pos[idx]
             dist_to_target = np.linalg.norm(direction) + 1e-6
-            self.ball_vel = (direction / dist_to_target) * self.ball_speed
+            
+            # Aumenta la velocità della palla per i tiri
+            base_speed = self.ball_speed * 1.5 if is_shooting else self.ball_speed * 1.2
+            self.ball_vel = (direction / dist_to_target) * base_speed * power_mult
 
             # --- LOGICA EFFETTO A GIRO INTELLIGENTE ---
-            self.ball_spin = 0  # Default: tiro dritto
+            self.ball_spin = 0
             
             if is_shooting:
-                # Se la porta è angolata male (giocatore alto o basso rispetto al centro)
-                # Calcola quanto il giocatore è lontano dall'asse centrale della porta
-                offset_y = self.players_pos[idx][1] - (self.height / 2)
-                if abs(offset_y) > 100:
-                    # Applica spin per far rientrare la palla verso il centro
-                    # Se sono in alto (offset > 0), devo curvare verso il basso (spin negativo)
-                    self.ball_spin = -0.07 if offset_y > 0 else 0.07
+                # Se il tiro è angolato, aggiungi effetto
+                angle = np.arctan2(direction[1], direction[0])
+                if abs(angle) > 0.3:
+                    # Curva verso l'interno per i tiri da fuori
+                    self.ball_spin = -0.05 if angle > 0 else 0.05
             else:
-                # Se è un passaggio e il compagno è in diagonale
-                dx = abs(target[0] - self.players_pos[idx][0])
-                dy = abs(target[1] - self.players_pos[idx][1])
-                # Se il rapporto dy/dx è alto, sono in diagonale "stretta"
-                if dy > 0.8 * dx:
-                    # Spin casuale ma forte per simulare il filtrante a giro
-                    self.ball_spin = random.choice([-0.08, 0.08])
+                # Per i passaggi lunghi, aggiungi un po' di effetto
+                if dist_to_target > 200:
+                    self.ball_spin = random.uniform(-0.03, 0.03)
 
             self.ball_spin += random.uniform(-0.01, 0.01)
 
@@ -868,7 +1339,10 @@ class SoccerParallelEnv(ParallelEnv):
         # Se la palla va molto veloce (sopra 5.5), è "in aria" e nessuno la tocca
         diff = self.ball_pos - self.players_pos[idx]
         dist = np.linalg.norm(diff)
-        
+        ball_speed = np.linalg.norm(self.ball_vel)
+        if ball_speed >= 5.5:
+            if idx != 0 and idx != 11:
+                return
         # Riduciamo l'area di interazione per evitare tocchi "fantasma"
         if dist < self.player_radius + self.ball_radius + 2:
             team = "blue" if idx < 11 else "red"
@@ -877,7 +1351,7 @@ class SoccerParallelEnv(ParallelEnv):
             # Se la palla è molto veloce (gialla), il giocatore la "controlla" 
             # invece di farla schizzare via a caso
             if np.linalg.norm(self.ball_vel) > 5.5:
-                self.ball_vel *= 0.5  # Ammortizza il colpo
+                self.ball_vel *= 0.2  # Ammortizza il colpo
                 self.ball_spin = 0    # Annulla l'effetto strano
             
             # Applica una spinta direzionale basata sul movimento del giocatore
@@ -930,7 +1404,6 @@ class SoccerParallelEnv(ParallelEnv):
             self.elo_red += K*(1-er); self.elo_blue += K*(0-eb)
 
     def render(self):
-        
         if self.screen is None:
             pygame.init()
             self.screen = pygame.display.set_mode((self.width, self.height))
@@ -938,13 +1411,15 @@ class SoccerParallelEnv(ParallelEnv):
             pygame.display.set_caption("Soccer AI Pro v2")
             self.font = pygame.font.SysFont("Arial", 24, bold=True)
             self.small_font = pygame.font.SysFont("Arial", 18, bold=True)
+            self.timer_font = pygame.font.SysFont("Arial", 30, bold=True)
+            self.big_font = pygame.font.SysFont("Arial", 36, bold=True)
+            self.number_font = pygame.font.SysFont("Arial", 14, bold=True)  # Font per numeri
 
-        if self.free_kick_active or (hasattr(self, 'ball_curve_effect') and np.linalg.norm(self.ball_vel) > 8):
-            ball_color = (255, 255, 0) # GIALLO: Tiro punizione in corso
-
-        self.screen.fill((34,139,34))
+        # Disegna il campo
+        self.screen.fill((34, 139, 34))  # Verde campo
         white = (255, 255, 255)
         
+        # Linee del campo
         pygame.draw.rect(self.screen, white, (10, 10, self.width-20, self.height-20), 3)
         pygame.draw.line(self.screen, white, (self.width/2, 10), (self.width/2, self.height-10), 3)
         pygame.draw.circle(self.screen, white, (int(self.width/2), int(self.height/2)), 70, 3)
@@ -953,56 +1428,142 @@ class SoccerParallelEnv(ParallelEnv):
         pygame.draw.rect(self.screen, (200, 200, 200), (-5, 250, 15, 100))
         pygame.draw.rect(self.screen, (200, 200, 200), (self.width-10, 250, 15, 100))
 
+        # Calcola formazioni
         blue_mod = "4-5-1" if self.blue_score > self.red_score else "4-3-3"
         red_mod = "4-5-1" if self.red_score > self.blue_score else "4-3-3"
         
-        score_text = self.font.render(f"BLUE {self.blue_score} - {self.red_score} RED", True, white)
-        self.screen.blit(score_text, (self.width/2 - score_text.get_width()/2, 20))
+        # --- GESTIONE DELLE SCRITTE ---
+        y_offset = 20
         
-        blue_info = self.small_font.render(f"BLU: {blue_mod} | ELO: {int(self.elo_blue)}", True, (100, 200, 255))
-        red_info = self.small_font.render(f"RED: {red_mod} | ELO: {int(self.elo_red)}", True, (255, 100, 100))
+        # 1. Timer principale
+        seconds_left = max(0, self.match_timer // 60)
+        timer_text = self.timer_font.render(f"Tempo: {seconds_left}s", True, white)
+        self.screen.blit(timer_text, (self.width // 2 - timer_text.get_width() // 2, y_offset))
+        y_offset += 40
+        
+        # 2. Penalty shootout (se attivo)
+        if self.is_penalty_shootout:
+            penalty_text = self.big_font.render("CALCI DI RIGORE", True, (255, 255, 0))
+            self.screen.blit(penalty_text, (self.width // 2 - penalty_text.get_width() // 2, y_offset))
+            y_offset += 50
+            
+            shootout_info = self.font.render(f"Tentativo: {self.penalties_taken}/10", True, white)
+            self.screen.blit(shootout_info, (self.width // 2 - shootout_info.get_width() // 2, y_offset))
+            y_offset += 40
+            
+            # 3. VISUALIZZAZIONE RISULTATI RIGORI (quadratini)
+            box_size = 15
+            box_spacing = 5
+            start_x = self.width // 2 - (10 * (box_size + box_spacing)) // 2
+            start_y = 10
+            
+            for i in range(10):
+                box_x = start_x + i * (box_size + box_spacing)
+                
+                if i < len(self.penalty_results):
+                    team, scored = self.penalty_results[i]
+                    if scored:
+                        color = (0, 255, 0)  # Verde per goal
+                    else:
+                        color = (255, 0, 0)  # Rosso per fallimento
+                    
+                    # Colore di sfondo per squadra
+                    if team == "blue":
+                        bg_color = (40, 80, 200, 100)
+                    else:
+                        bg_color = (200, 40, 40, 100)
+                    
+                    # Disegna sfondo squadra
+                    s = pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+                    s.fill(bg_color)
+                    self.screen.blit(s, (box_x, start_y))
+                    
+                    # Disegna quadratino risultato
+                    pygame.draw.rect(self.screen, color, (box_x, start_y, box_size, box_size))
+                    pygame.draw.rect(self.screen, white, (box_x, start_y, box_size, box_size), 1)
+                    
+                    # Numero del tentativo
+                    num_text = self.number_font.render(str(i+1), True, white)
+                    self.screen.blit(num_text, (box_x + 3, start_y + 1))
+                else:
+                    # Quadratino vuoto per tentativi futuri
+                    pygame.draw.rect(self.screen, (100, 100, 100), (box_x, start_y, box_size, box_size))
+                    pygame.draw.rect(self.screen, white, (box_x, start_y, box_size, box_size), 1)
+            
+            y_offset = start_y + box_size + 20
+        
+        # 4. Free kick / Penalty
+        if self.free_kick_active and not self.is_penalty_shootout:
+            if self.is_penalty:
+                penalty_text = self.big_font.render("RIGORE", True, (255, 0, 0))
+                self.screen.blit(penalty_text, (self.width // 2 - penalty_text.get_width() // 2, y_offset))
+            else:
+                freekick_text = self.big_font.render("FREE KICK", True, (255, 255, 0))
+                self.screen.blit(freekick_text, (self.width // 2 - freekick_text.get_width() // 2, y_offset))
+            y_offset += 50
+        
+        # 5. Formazioni (in angoli)
+        blue_info = self.small_font.render(f"BLU: {blue_mod}", True, (100, 200, 255))
+        red_info = self.small_font.render(f"RED: {red_mod}", True, (255, 100, 100))
         self.screen.blit(blue_info, (50, 20))
         self.screen.blit(red_info, (self.width - red_info.get_width() - 50, 20))
-        if self.free_kick_active:
-            text = self.font.render("FREE KICK", True, (255,255,0))
-            self.screen.blit(text, (self.width/2 - 60, 60))
-
+        
+        # 6. Punteggio (in basso)
+        score_text = self.font.render(f"BLUE {self.blue_score} - {self.red_score} RED", True, white)
+        self.screen.blit(score_text, (self.width // 2 - score_text.get_width() // 2, self.height - 40))
+        
+        # --- DISEGNO GIOCATORI CON NUMERI ---
         for i in range(22):
-            # 1. Definizione colori "via di mezzo" (bilanciati)
+            # Colore in base a ruolo e stato
             if i == 0 or i == 11:
-                color = (240, 240, 240)  # Bianco sporco/Ghiaccio per i GK (meno accecante)
+                color = (240, 240, 240)  # Portieri
             elif i < 11:
-                color = (40, 80, 200)    # Blu reale (meno elettrico del pure blue)
+                color = (40, 80, 200)    # Blu
             else:
-                color = (200, 40, 40)    # Rosso cardinale (meno forte del pure red)
+                color = (200, 40, 40)    # Rossi
             
+            # Gestione stati (stun, slow)
             if not self.free_kick_active:
                 if self.stun_timer[i] > 0:
-                    color = (100, 100, 100)  # Grigio medio
+                    color = (100, 100, 100)  # Stunnato
                 elif self.slow_timer[i] > 0:
-                    color = (160, 160, 160)  # Grigio chiaro
+                    color = (160, 160, 160)  # Rallentato
 
-            # 3. Disegno del giocatore con bordi BIANCHI
-            # Bordo Bianco (fisso)
-            pygame.draw.circle(self.screen, (255, 255, 255), self.players_pos[i].astype(int), 11)
-            # Cerchio interno (dinamico)
-            pygame.draw.circle(self.screen, color, self.players_pos[i].astype(int), 9)
-
-        # Nel metodo render()
-        ball_speed_norm = np.linalg.norm(self.ball_vel)
+            # Disegna giocatore con bordo bianco
+            pos = self.players_pos[i].astype(int)
+            pygame.draw.circle(self.screen, (255, 255, 255), pos, 11)
+            pygame.draw.circle(self.screen, color, pos, 9)
+            
+            # Aggiungi numero del giocatore
+            if i < 11:
+                player_num = i  # 0-10 per i blu
+            else:
+                player_num = i - 11  # 0-10 per i rossi
+            
+            # I portieri sono sempre 0
+            if i == 0 or i == 11:
+                player_num = 0
+            
+            num_text = self.number_font.render(str(player_num), True, (0, 0, 0))
+            text_rect = num_text.get_rect(center=pos)
+            self.screen.blit(num_text, text_rect)
         
-        # Logica colore palla prioritaria
+        # --- DISEGNO PALLA ---
+        ball_speed_norm = np.linalg.norm(self.ball_vel)
         is_being_dribbled = any(self.dribble_timer > 0)
         
         if is_being_dribbled:
-            ball_color = (0, 255, 127)   # VERDE: Dribbling in corso
+            ball_color = (0, 255, 127)   # VERDE: Dribbling
         elif ball_speed_norm > 5.5 or self.is_goal_kick:
-            ball_color = (255, 255, 0)   # GIALLO: Volo o Rinvio
+            ball_color = (255, 255, 0)   # GIALLO: Volo/Rinvio
+        elif self.free_kick_active:
+            ball_color = (255, 255, 0)   # GIALLO: Calcio piazzato
         else:
             ball_color = (255, 255, 255) # BIANCO: Normale
-            
-        pygame.draw.circle(self.screen, (0,0,0), self.ball_pos.astype(int), 7)
-        pygame.draw.circle(self.screen, ball_color, self.ball_pos.astype(int), 6)
+        
+        ball_pos_int = self.ball_pos.astype(int)
+        pygame.draw.circle(self.screen, (0, 0, 0), ball_pos_int, 7)
+        pygame.draw.circle(self.screen, ball_color, ball_pos_int, 6)
         
         pygame.display.flip()
         self.clock.tick(60)
